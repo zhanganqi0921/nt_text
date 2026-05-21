@@ -4,9 +4,12 @@
 - Marker Mask：P1/P2 为半径 circle_radius 的圆，连线线宽 line_thickness；背景 0、标记 255。
 - Clean Image：对 mask 区域做 OpenCV inpaint（默认 TELEA），供训练使用（非 labeled_vis）。
 
-输入：labels 下 CSV（默认 dataset_350-700.csv），需含 image_path_raw_png、x1,y1,x2,y2。
-输出：masks_marker/{image_id}_mask.png，images_clean/{image_id}_clean.png；
-可选：clean_vis/{image_id}_vis.png（原图 | mask 上色 | clean 横向拼接）。
+输入：配置的数据根目录下的 labels CSV（默认 dataset_350-700.csv），需含 image_path_raw_png、x1,y1,x2,y2。
+输出：配置的数据子目录下的 masks_marker/2/{image_id}_mask.png，images_clean/2/{image_id}_clean.png；
+默认生成：clean_vis/2/{image_id}_vis.png（原图 | mask | clean | 原图叠加 mask 和 P1/P2）。
+
+路径配置：
+- 数据根目录与 0/1/2 子集在 `scripts/dataset_paths.py` 中修改。
 """
 from __future__ import annotations
 
@@ -21,12 +24,7 @@ from typing import TextIO
 import cv2
 import numpy as np
 
-DATASET_DIR = Path(__file__).resolve().parents[1]
-LABELS_DIR = DATASET_DIR / "labels"
-LOG_DIR = DATASET_DIR / "logs"
-MASK_DIR = DATASET_DIR / "masks_marker"
-CLEAN_DIR = DATASET_DIR / "images_clean"
-VIS_DIR = DATASET_DIR / "clean_vis"
+from dataset_paths import CLEAN_DIR, CLEAN_VIS_DIR, DATASET_DIR, LABELS_DIR, LOG_DIR, MASK_DIR
 
 
 def imread_unicode(path: Path) -> np.ndarray | None:
@@ -90,17 +88,36 @@ def build_marker_mask(
     return mask
 
 
-def _mask_overlay_bgr(mask_u8: np.ndarray) -> np.ndarray:
-    """灰度 mask -> 便于拼接的 BGR（标记为红色）。"""
-    base = cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
-    red = np.zeros_like(base)
+def _mask_bgr(mask_u8: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
+
+
+def _raw_overlay_bgr(
+    orig_bgr: np.ndarray,
+    mask_u8: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+) -> np.ndarray:
+    overlay = orig_bgr.copy()
+    red = np.zeros_like(overlay)
     red[:, :, 2] = mask_u8
-    return cv2.addWeighted(base, 0.35, red, 0.65, 0.0)
+    overlay = cv2.addWeighted(overlay, 0.75, red, 0.25, 0.0)
+    cv2.circle(overlay, p1, 8, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+    cv2.circle(overlay, p2, 8, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+    cv2.putText(overlay, "P1", (p1[0] + 10, p1[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(overlay, "P2", (p2[0] + 10, p2[1] + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    return overlay
 
 
-def make_triptych(orig_bgr: np.ndarray, mask_u8: np.ndarray, clean_bgr: np.ndarray) -> np.ndarray:
-    mid = _mask_overlay_bgr(mask_u8)
-    return np.hstack([orig_bgr, mid, clean_bgr])
+def make_check_vis(
+    orig_bgr: np.ndarray,
+    mask_u8: np.ndarray,
+    clean_bgr: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+) -> np.ndarray:
+    overlay = _raw_overlay_bgr(orig_bgr, mask_u8, p1, p2)
+    return np.hstack([orig_bgr, _mask_bgr(mask_u8), clean_bgr, overlay])
 
 
 def main() -> None:
@@ -115,12 +132,12 @@ def main() -> None:
     parser.add_argument(
         "--line-thickness",
         type=int,
-        default=None,
-        help="连线线宽（像素）；默认按端点距离在 3–5 间估算",
+        default=4,
+        help="连线线宽（像素）",
     )
     parser.add_argument("--line-thickness-min", type=int, default=3)
     parser.add_argument("--line-thickness-max", type=int, default=5)
-    parser.add_argument("--inpaint-radius", type=int, default=5, help="cv2.inpaint 邻域半径")
+    parser.add_argument("--inpaint-radius", type=int, default=3, help="cv2.inpaint 邻域半径")
     parser.add_argument(
         "--inpaint",
         choices=("telea", "ns"),
@@ -128,9 +145,9 @@ def main() -> None:
         help="inpaint 算法：telea 或 ns",
     )
     parser.add_argument(
-        "--vis",
+        "--no-vis",
         action="store_true",
-        help="写入 clean_vis 下三列拼接复查图",
+        help="不写入 clean_vis 检查图",
     )
     parser.add_argument(
         "--log",
@@ -157,6 +174,10 @@ def main() -> None:
         sys.exit(1)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    MASK_DIR.mkdir(parents=True, exist_ok=True)
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
+    if not args.no_vis:
+        CLEAN_VIS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = args.log.resolve() if args.log.is_absolute() else (DATASET_DIR / args.log).resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -270,9 +291,9 @@ def main() -> None:
                     n_skip += 1
                     continue
 
-                if args.vis:
-                    vis = make_triptych(bgr, mask, clean)
-                    vis_path = VIS_DIR / f"{image_id}_vis.png"
+                if not args.no_vis:
+                    vis = make_check_vis(bgr, mask, clean, (cx1, cy1), (cx2, cy2))
+                    vis_path = CLEAN_VIS_DIR / f"{image_id}_vis.png"
                     if not imwrite_unicode(vis_path, vis):
                         log_line(logf, f"WARN vis write failed: {vis_path}")
 
@@ -283,7 +304,7 @@ def main() -> None:
 
     if issues:
         print(f"共 {len(issues)} 条异常/跳过，详见 {log_path}", file=sys.stderr)
-    print(f"完成: mask={MASK_DIR} clean={CLEAN_DIR} log={log_path}")
+    print(f"完成: mask={MASK_DIR} clean={CLEAN_DIR} clean_vis={CLEAN_VIS_DIR} log={log_path}")
 
 
 if __name__ == "__main__":

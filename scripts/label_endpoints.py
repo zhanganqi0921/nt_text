@@ -2,22 +2,25 @@
 端点标注主流程脚本：调用 LabelMe 标注，并将结果标准化为 CSV 与复查图。
 
 整体流程：
-1) 打开 `dataset/images_raw_png` 进行标注（可用 `--sync-only` 跳过此步骤）；
-2) 将 LabelMe 可能落在图片目录下的 JSON 统一归档到 `dataset/labels/labelme_json`；
+1) 打开配置的 PNG 子目录（默认 `/Users/zaq/Desktop/dataset/images_raw_png/2`）进行标注（可用 `--sync-only` 跳过此步骤）；
+2) 将 LabelMe 可能落在图片目录下的 JSON 统一归档到配置的数据根目录下的 `labels/labelme_json`；
 3) 解析 JSON 中的两端点（支持 `P1/P2` point 或单条两点 line/linestrip）；
-4) 写入/更新 `dataset/labels/endpoints.csv`；
-5) 同步生成 `dataset/images_labeled_vis/{image_id}_labeled.png` 用于人工复查。
+4) 写入/更新配置的数据根目录下的 `labels/endpoints.csv`；
+5) 同步生成配置的数据子目录下的 `images_labeled_vis/2/{image_id}_labeled.png` 用于人工复查。
 
 输入与输出：
-- 输入图像目录：`dataset/images_raw_png`
-- 输入标注目录：`dataset/labels/labelme_json`
-- 输出标注表：`dataset/labels/endpoints.csv`
-- 输出复查图：`dataset/images_labeled_vis/*_labeled.png`
+- 输入图像目录：`PNG_DIR`
+- 输入标注目录：`LABELME_JSON_DIR`
+- 输出标注表：`ENDPOINTS_CSV`
+- 输出复查图：`VIS_DIR/*_labeled.png`
 
 关键约定：
 - 优先读取标签为 `P1` / `P2` 的 point；
 - 若无显式标签，可回退为“恰好两个未命名 point”；
 - 若不满足两端点规则，记录为跳过并在汇总中按原因分组提示。
+
+路径配置：
+- 数据根目录与 0/1/2 子集在 `scripts/dataset_paths.py` 中修改。
 """
 from __future__ import annotations
 
@@ -34,16 +37,18 @@ from typing import Any
 import cv2
 import numpy as np
 
-DATASET_DIR = Path(__file__).resolve().parents[1]
-PNG_DIR = DATASET_DIR / "images_raw_png"
-VIS_DIR = DATASET_DIR / "images_labeled_vis"
-LABELS_DIR = DATASET_DIR / "labels"
-LABELME_JSON_DIR = LABELS_DIR / "labelme_json"
-ENDPOINTS_CSV = LABELS_DIR / "endpoints.csv"
+from dataset_paths import (
+    DATASET_DIR,
+    ENDPOINTS_CSV,
+    LABELME_JSON_DIR,
+    LABELS_DIR,
+    PNG_DIR,
+    VIS_DIR,
+)
 
 FIELDNAMES = [
     "image_id",
-    "image_path",
+    "image_path_raw_png",
     "x1",
     "y1",
     "x2",
@@ -89,9 +94,14 @@ def load_endpoints() -> dict[str, dict[str, Any]]:
                 labeled = int(row.get("labeled", "0") or "0")
             except ValueError:
                 labeled = 0
+            image_path = (
+                row.get("image_path_raw_png")
+                or row.get("image_path")
+                or ""
+            ).strip()
             out[iid] = {
                 "image_id": iid,
-                "image_path": (row.get("image_path") or "").strip(),
+                "image_path_raw_png": image_path,
                 "x1": row.get("x1", ""),
                 "y1": row.get("y1", ""),
                 "x2": row.get("x2", ""),
@@ -110,7 +120,7 @@ def write_endpoints(rows_by_id: dict[str, dict[str, Any]]) -> None:
         for r in rows:
             line = {
                 "image_id": r["image_id"],
-                "image_path": r.get("image_path", ""),
+                "image_path_raw_png": r.get("image_path_raw_png", ""),
                 "x1": str(r.get("x1", "")),
                 "y1": str(r.get("y1", "")),
                 "x2": str(r.get("x2", "")),
@@ -162,7 +172,7 @@ def write_labeled_review_png(
     x2: int,
     y2: int,
 ) -> Path:
-    """写入 dataset/images_labeled_vis/{image_id}_labeled.png。"""
+    """写入配置的数据子目录下的 images_labeled_vis/{set}/{image_id}_labeled.png。"""
     out_path = VIS_DIR / f"{image_id}_labeled.png"
     vis = draw_labeled_review_image(base_bgr, x1, y1, x2, y2)
     if not imwrite_unicode(out_path, vis):
@@ -259,7 +269,7 @@ def label_one_image(
             (x1, y1), (x2, y2) = points
             rows_by_id[image_id] = {
                 "image_id": image_id,
-                "image_path": rel_path,
+                "image_path_raw_png": rel_path,
                 "x1": x1,
                 "y1": y1,
                 "x2": x2,
@@ -393,7 +403,7 @@ def sync_from_labelme_json() -> tuple[int, int, list[tuple[str, str]]]:
             image_id, rel_path, x1, y1, x2, y2 = parse_labelme_json(json_path)
             rows_by_id[image_id] = {
                 "image_id": image_id,
-                "image_path": rel_path,
+                "image_path_raw_png": rel_path,
                 "x1": x1,
                 "y1": y1,
                 "x2": x2,
@@ -439,19 +449,63 @@ def launch_labelme() -> None:
         ) from e
 
 
+def _is_labeled(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    try:
+        return int(row.get("labeled", 0) or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def run_interactive_labeling(relabel_image_id: str | None = None) -> None:
+    if not PNG_DIR.is_dir():
+        raise SystemExit(f"未找到目录: {PNG_DIR}")
+    rows_by_id = load_endpoints()
+    pngs = sorted(PNG_DIR.glob("*.png"))
+    if relabel_image_id:
+        pngs = [p for p in pngs if p.stem == relabel_image_id]
+        if not pngs:
+            raise SystemExit(f"未找到要重新标注的图片: {relabel_image_id}")
+
+    skipped = 0
+    for png_path in pngs:
+        if not relabel_image_id and _is_labeled(rows_by_id.get(png_path.stem)):
+            skipped += 1
+            continue
+        should_quit = label_one_image(png_path, rows_by_id)
+        if should_quit:
+            write_endpoints(rows_by_id)
+            print("已保存当前进度并退出。")
+            break
+    print(f"端点标注结束: 已跳过既有标注 {skipped} 张，endpoints={ENDPOINTS_CSV}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LabelMe 端点标注同步")
+    parser = argparse.ArgumentParser(description="端点标注与 LabelMe JSON 同步")
     parser.add_argument(
         "--sync-only",
         action="store_true",
         help="仅同步 JSON 到 endpoints.csv，不打开 LabelMe",
     )
+    parser.add_argument(
+        "--labelme",
+        action="store_true",
+        help="使用 LabelMe 标注；默认使用本脚本的双点标注窗口并自动跳过已标注图像",
+    )
+    parser.add_argument(
+        "--relabel",
+        metavar="IMAGE_ID",
+        help="重新标注指定 image_id（不带 .png）",
+    )
     args = parser.parse_args()
 
     LABELME_JSON_DIR.mkdir(parents=True, exist_ok=True)
     VIS_DIR.mkdir(parents=True, exist_ok=True)
-    if not args.sync_only:
+    if args.labelme and not args.sync_only:
         launch_labelme()
+    elif not args.sync_only:
+        run_interactive_labeling(args.relabel)
 
     moved = relocate_labelme_json_from_png_dir()
     if moved:
